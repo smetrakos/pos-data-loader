@@ -1,0 +1,35 @@
+name: Data Loader
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'  # every 4 hours
+  workflow_dispatch:        # allows manual trigger from GitHub UI
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run loader
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SHOPIFY_INBOX_ID: ${{ secrets.SHOPIFY_INBOX_ID }}
+          SHOPIFY_PROCESSED_ID: ${{ secrets.SHOPIFY_PROCESSED_ID }}
+          POS_INBOX_ID: ${{ secrets.POS_INBOX_ID }}
+          POS_PROCESSED_ID: ${{ secrets.POS_PROCESSED_ID }}
+          ERRORS_FOLDER_ID: ${{ secrets.ERRORS_FOLDER_ID }}
+        run: python loader.py
