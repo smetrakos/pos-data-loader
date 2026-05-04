@@ -6,6 +6,7 @@ and upserts to Supabase.
 
 import os
 import io
+import csv
 import json
 import sys
 from datetime import datetime
@@ -121,15 +122,15 @@ def validate_columns(df, expected, source_name):
 # NORMALIZATION HELPERS
 # ============================================================
 
-def to_cents(value):
-    """Convert dollar amount to integer cents. Returns None if blank."""
+def to_dollars(value):
+    """Clean a dollar amount value. Returns None if blank, else float rounded to 2 decimals."""
     if pd.isna(value) or value == '':
         return None
     if isinstance(value, str):
         value = value.replace('$', '').replace(',', '').strip()
         if not value:
             return None
-    return int(round(float(value) * 100))
+    return round(float(value), 2)
 
 
 def to_text(value):
@@ -144,7 +145,6 @@ def to_zip(value):
     """ZIPs must be text to preserve leading zeros."""
     if pd.isna(value):
         return None
-    # Handle floats like 5678.0 from Excel reading numeric ZIPs
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip() or None
@@ -177,14 +177,13 @@ def normalize_shopify(df):
     out['item_description'] = df['Item Description'].apply(to_text)
     out['created_date'] = df['Created Date'].apply(to_date)
     out['transaction_date'] = df['Transaction Date'].apply(to_date)
-    out['price_cents'] = df['Price'].apply(to_cents)
-    out['consigner_split_cents'] = df['Consigner Split'].apply(to_cents)
-    out['cost_cents'] = df['Cost'].apply(to_cents)
+    out['price'] = df['Price'].apply(to_dollars)
+    out['consigner_split'] = df['Consigner Split'].apply(to_dollars)
+    out['cost'] = df['Cost'].apply(to_dollars)
     out['category'] = df['Category'].apply(to_text)
     out['terminal'] = df['Terminal'].apply(to_text)
 
-    # Drop rows with no order_id or no transaction date
-    out = out[out['order_id'].notna() & (out['order_id'] != '') 
+    out = out[out['order_id'].notna() & (out['order_id'] != '')
               & (out['order_id'] != 'nan')]
     out = out[out['transaction_date'].notna()]
     return out
@@ -192,7 +191,7 @@ def normalize_shopify(df):
 
 def normalize_pos(df):
     """Map Traxia POS export columns to pos_orders schema.
-    
+
     Note: source uses 'Region', we normalize to 'state' to match Shopify.
     """
     out = pd.DataFrame()
@@ -206,13 +205,13 @@ def normalize_pos(df):
     out['item_description'] = df['Item Description'].apply(to_text)
     out['created_date'] = df['Created Date'].apply(to_date)
     out['transaction_date'] = df['Transaction Date'].apply(to_date)
-    out['price_cents'] = df['Price'].apply(to_cents)
-    out['consigner_split_cents'] = df['Consigner Split'].apply(to_cents)
-    out['cost_cents'] = df['Cost'].apply(to_cents)
+    out['price'] = df['Price'].apply(to_dollars)
+    out['consigner_split'] = df['Consigner Split'].apply(to_dollars)
+    out['cost'] = df['Cost'].apply(to_dollars)
     out['category'] = df['Category'].apply(to_text)
     out['terminal'] = df['Terminal'].apply(to_text)
 
-    out = out[out['order_id'].notna() & (out['order_id'] != '') 
+    out = out[out['order_id'].notna() & (out['order_id'] != '')
               & (out['order_id'] != 'nan')]
     out = out[out['transaction_date'].notna()]
     return out
@@ -239,18 +238,16 @@ def upsert_orders(engine, df, source_filename, target_table):
     df = df.copy()
     df['source_file'] = source_filename
 
-    # Column order must match the target table
     columns = [
         'order_id', 'sku', 'customer_full_name', 'address',
         'city', 'state', 'zip', 'item_description',
         'created_date', 'transaction_date',
-        'price_cents', 'consigner_split_cents', 'cost_cents',
+        'price', 'consigner_split', 'cost',
         'category', 'terminal', 'source_file'
     ]
     df = df[columns]
 
     # Build CSV in memory for COPY
-    import csv
     buffer = io.StringIO()
     writer = csv.writer(buffer, quoting=csv.QUOTE_MINIMAL)
     for _, row in df.iterrows():
