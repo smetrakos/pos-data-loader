@@ -229,56 +229,82 @@ NORMALIZERS = {
 # ============================================================
 
 def upsert_orders(engine, df, source_filename, target_table):
-    """Insert new orders or update existing ones (matched by order_id)."""
+    """
+    Bulk upsert using a temp table + COPY for speed.
+    Handles 10k+ rows in seconds vs minutes.
+    """
     if len(df) == 0:
         return 0, 0
 
     df = df.copy()
     df['source_file'] = source_filename
 
-    inserted = 0
-    updated = 0
+    # Column order must match the target table
+    columns = [
+        'order_id', 'sku', 'customer_full_name', 'address',
+        'city', 'state', 'zip', 'item_description',
+        'created_date', 'transaction_date',
+        'price_cents', 'consigner_split_cents', 'cost_cents',
+        'category', 'terminal', 'source_file'
+    ]
+    df = df[columns]
 
-    upsert_sql = text(f"""
-        INSERT INTO {target_table}
-        (order_id, sku, customer_full_name, address, city, state, zip,
-         item_description, created_date, transaction_date,
-         price_cents, consigner_split_cents, cost_cents,
-         category, terminal, source_file)
-        VALUES
-        (:order_id, :sku, :customer_full_name, :address, :city, :state, :zip,
-         :item_description, :created_date, :transaction_date,
-         :price_cents, :consigner_split_cents, :cost_cents,
-         :category, :terminal, :source_file)
-        ON CONFLICT (order_id) DO UPDATE SET
-            sku = EXCLUDED.sku,
-            customer_full_name = EXCLUDED.customer_full_name,
-            address = EXCLUDED.address,
-            city = EXCLUDED.city,
-            state = EXCLUDED.state,
-            zip = EXCLUDED.zip,
-            item_description = EXCLUDED.item_description,
-            created_date = EXCLUDED.created_date,
-            transaction_date = EXCLUDED.transaction_date,
-            price_cents = EXCLUDED.price_cents,
-            consigner_split_cents = EXCLUDED.consigner_split_cents,
-            cost_cents = EXCLUDED.cost_cents,
-            category = EXCLUDED.category,
-            terminal = EXCLUDED.terminal,
-            source_file = EXCLUDED.source_file,
-            loaded_at = NOW()
-        RETURNING (xmax = 0) AS inserted
-    """)
+    # Build CSV in memory for COPY
+    import csv
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, quoting=csv.QUOTE_MINIMAL)
+    for _, row in df.iterrows():
+        writer.writerow([
+            '' if pd.isna(v) else v for v in row.tolist()
+        ])
+    buffer.seek(0)
 
-    with engine.begin() as conn:
-        for _, row in df.iterrows():
-            # Convert NaN to None for SQL compatibility
-            params = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
-            result = conn.execute(upsert_sql, params)
-            if result.scalar():
-                inserted += 1
-            else:
-                updated += 1
+    raw_conn = engine.raw_connection()
+    try:
+        cur = raw_conn.cursor()
+        try:
+            # Create a temp table matching the target table's structure
+            cur.execute(f"""
+                CREATE TEMP TABLE _staging (LIKE {target_table} INCLUDING DEFAULTS)
+                ON COMMIT DROP
+            """)
+
+            # Bulk COPY into staging — this is the fast part
+            cur.copy_expert(
+                f"COPY _staging ({', '.join(columns)}) FROM STDIN WITH CSV NULL ''",
+                buffer
+            )
+
+            # Single bulk upsert from staging into the real table
+            non_key_columns = [c for c in columns if c != 'order_id']
+            update_clause = ', '.join(
+                f"{c} = EXCLUDED.{c}" for c in non_key_columns
+            )
+
+            cur.execute(f"""
+                WITH upserted AS (
+                    INSERT INTO {target_table} ({', '.join(columns)})
+                    SELECT {', '.join(columns)} FROM _staging
+                    ON CONFLICT (order_id) DO UPDATE SET
+                        {update_clause},
+                        loaded_at = NOW()
+                    RETURNING (xmax = 0) AS was_inserted
+                )
+                SELECT
+                    SUM(CASE WHEN was_inserted THEN 1 ELSE 0 END) AS inserted,
+                    SUM(CASE WHEN NOT was_inserted THEN 1 ELSE 0 END) AS updated
+                FROM upserted
+            """)
+
+            result = cur.fetchone()
+            inserted = int(result[0] or 0)
+            updated = int(result[1] or 0)
+
+            raw_conn.commit()
+        finally:
+            cur.close()
+    finally:
+        raw_conn.close()
 
     return inserted, updated
 
